@@ -7,7 +7,9 @@ from dedupe_vault import (
     pick_keeper,
     plan_moves,
     public_item_view,
+    report_ids,
     richness,
+    select_delete_candidates,
 )
 
 
@@ -163,6 +165,66 @@ class PlanTests(unittest.TestCase):
         self.assertNotIn("otpauth", dumped)
         self.assertTrue(view["hasTotp"])
         self.assertTrue(view["hasPassword"])
+
+
+class DeleteCandidateTests(unittest.TestCase):
+    def test_without_report_deletes_everything_in_folder(self):
+        a = login("a", "Site", "me", ["https://example.com"], folder_id="dup")
+        b = login("b", "Other", "me", ["https://other.com"], folder_id="keep")
+        to_delete, skipped = select_delete_candidates(
+            [a, b], folder_id="dup", report=None, skip_org=False, include_keepers=False
+        )
+        self.assertEqual([i["id"] for i in to_delete], ["a"])
+        self.assertEqual(skipped, [])
+
+    def test_report_skips_keepers_and_unlisted_items(self):
+        keeper = login("k", "Site", "me", ["https://example.com"], folder_id="dup")
+        extra = login("e", "Site", "me", ["https://example.com"], folder_id="dup")
+        other = login("o", "Unrelated", "x", ["https://x.com"], folder_id="dup")
+        restored = login("r", "Site", "me", ["https://example.com"], folder_id="inbox")
+        report = {
+            "groups": [{"keeper": {"id": "k"}}],
+            "moved": [
+                {"id": "e", "keeperId": "k"},
+                {"id": "r", "keeperId": "k"},
+            ],
+        }
+        to_delete, skipped = select_delete_candidates(
+            [keeper, extra, other, restored],
+            folder_id="dup",
+            report=report,
+            skip_org=False,
+            include_keepers=False,
+        )
+        self.assertEqual([i["id"] for i in to_delete], ["e"])
+        self.assertEqual([i["id"] for i in skipped], ["k"])
+
+    def test_include_keepers(self):
+        keeper = login("k", "Site", "me", ["https://example.com"], folder_id="dup")
+        extra = login("e", "Site", "me", ["https://example.com"], folder_id="dup")
+        report = {
+            "groups": [{"keeper": {"id": "k"}}],
+            "moved": [{"id": "e", "keeperId": "k"}, {"id": "k", "keeperId": "k"}],
+        }
+        to_delete, skipped = select_delete_candidates(
+            [keeper, extra],
+            folder_id="dup",
+            report=report,
+            skip_org=False,
+            include_keepers=True,
+        )
+        self.assertEqual({i["id"] for i in to_delete}, {"k", "e"})
+        self.assertEqual(skipped, [])
+
+    def test_report_ids(self):
+        moved, keepers = report_ids(
+            {
+                "groups": [{"keeper": {"id": "k"}}],
+                "moved": [{"id": "e", "keeperId": "k"}],
+            }
+        )
+        self.assertEqual(moved, {"e"})
+        self.assertEqual(keepers, {"k"})
 
 
 if __name__ == "__main__":

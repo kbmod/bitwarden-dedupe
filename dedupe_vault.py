@@ -269,6 +269,63 @@ def plan_moves(
     return planned
 
 
+def load_report(path: str) -> dict[str, Any]:
+    with open(path, encoding="utf-8") as fh:
+        report = json.load(fh)
+    if not isinstance(report, dict):
+        raise BwError("Report file must be a JSON object.")
+    return report
+
+
+def report_ids(report: dict[str, Any]) -> tuple[set[str], set[str]]:
+    """Return (moved item ids, keeper ids) from a previous run's report."""
+    moved = {row["id"] for row in (report.get("moved") or []) if row.get("id")}
+    keepers: set[str] = set()
+    for group in report.get("groups") or []:
+        keeper = group.get("keeper") or {}
+        if keeper.get("id"):
+            keepers.add(keeper["id"])
+    for row in report.get("moved") or []:
+        if row.get("keeperId"):
+            keepers.add(row["keeperId"])
+    return moved, keepers
+
+
+def select_delete_candidates(
+    items: list[dict[str, Any]],
+    folder_id: str,
+    report: dict[str, Any] | None,
+    skip_org: bool,
+    include_keepers: bool,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Items in the review folder that should be deleted after manual review.
+
+    If a report is given, only previously moved extras are selected, and keepers
+    are skipped unless include_keepers is set. Items already moved out of the
+    folder (kept after review) are not selected.
+    """
+    in_folder = [i for i in items if i.get("id") and i.get("folderId") == folder_id]
+    moved_ids: set[str] | None = None
+    keeper_ids: set[str] = set()
+    if report is not None:
+        moved_ids, keeper_ids = report_ids(report)
+
+    to_delete: list[dict[str, Any]] = []
+    skipped_keepers: list[dict[str, Any]] = []
+    for item in in_folder:
+        if skip_org and item.get("organizationId"):
+            continue
+        if moved_ids is not None and item["id"] not in moved_ids and item["id"] not in keeper_ids:
+            continue
+        if item["id"] in keeper_ids and not include_keepers:
+            skipped_keepers.append(item)
+            continue
+        if moved_ids is not None and item["id"] not in moved_ids:
+            continue
+        to_delete.append(item)
+    return to_delete, skipped_keepers
+
+
 # ---------------------------------------------------------------------------
 # Bitwarden CLI
 # ---------------------------------------------------------------------------
@@ -405,13 +462,14 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description=(
             "Find duplicate Bitwarden logins and move the extras into a folder "
-            "so you can review and delete them. Dry-run unless --apply is set."
+            "so you can review them. After review, --delete-reviewed sends "
+            "remaining extras to Bitwarden trash. Dry-run unless --apply is set."
         )
     )
     p.add_argument(
         "--apply",
         action="store_true",
-        help="Actually move items. Without this flag, only print a plan.",
+        help="Actually move or delete items. Without this flag, only print a plan.",
     )
     p.add_argument(
         "--strategy",
@@ -471,6 +529,30 @@ def build_parser() -> argparse.ArgumentParser:
         help="Restore folderIds from a previous --report file.",
     )
     p.add_argument(
+        "--delete-reviewed",
+        action="store_true",
+        help=(
+            "After manual review, delete items still in the review folder. "
+            "Sends them to Bitwarden trash (30 days) unless --permanent. "
+            "Move anything you want to keep out of the folder first."
+        ),
+    )
+    p.add_argument(
+        "--permanent",
+        action="store_true",
+        help="With --delete-reviewed, skip trash and permanently delete. Irreversible.",
+    )
+    p.add_argument(
+        "--include-keepers",
+        action="store_true",
+        help="With --delete-reviewed and a --report, also delete keeper copies still in the folder.",
+    )
+    p.add_argument(
+        "--yes",
+        action="store_true",
+        help="Do not prompt for confirmation when applying deletes.",
+    )
+    p.add_argument(
         "--delay",
         type=float,
         default=0.15,
@@ -518,6 +600,103 @@ def print_plan(planned: list[dict[str, Any]]) -> None:
         print()
 
 
+def confirm_delete(count: int, folder: str, permanent: bool, yes: bool) -> None:
+    dest = "permanently (not recoverable)" if permanent else "to Bitwarden trash (recoverable ~30 days)"
+    prompt = f"Delete {count} item(s) from {folder!r} {dest}?"
+    if yes:
+        print(prompt)
+        return
+    if not sys.stdin.isatty():
+        raise BwError("Refusing to delete without a TTY. Re-run with --yes.")
+    print(prompt)
+    typed = input("Type DELETE to continue: ").strip()
+    if typed != "DELETE":
+        raise BwError("Aborted.")
+
+
+def delete_item(item_id: str, session: str, permanent: bool) -> None:
+    args = ["delete", "item", item_id]
+    if permanent:
+        args.append("--permanent")
+    bw_cmd(args, session)
+
+
+def cmd_delete_reviewed(
+    args: argparse.Namespace,
+    items: list[dict[str, Any]],
+    folders: list[dict[str, Any]],
+) -> int:
+    existing = next((f for f in folders if f.get("name") == args.folder), None)
+    if not existing:
+        raise BwError(
+            f"Review folder {args.folder!r} does not exist. "
+            "Nothing to delete. Run a move pass with --apply first, or check --folder."
+        )
+    report = load_report(args.report) if args.report else None
+    if args.report and not (report.get("moved") or report.get("groups")):
+        raise BwError(f"{args.report} does not look like a dedupe report.")
+    if report is None:
+        print(
+            "No --report given; every item still in the review folder will be "
+            "deleted. Pass the JSON from the move run to skip keepers and ignore "
+            "unrelated items in that folder.\n"
+        )
+    to_delete, skipped_keepers = select_delete_candidates(
+        items,
+        folder_id=existing["id"],
+        report=report,
+        skip_org=args.skip_org,
+        include_keepers=args.include_keepers,
+    )
+    dest = "permanently" if args.permanent else "to trash"
+    if skipped_keepers:
+        print(f"Skipping {len(skipped_keepers)} keeper(s) still in {args.folder!r}:")
+        for item in skipped_keepers:
+            view = public_item_view(item)
+            print(f"  KEEP  {view['id']}  {view.get('name') or '(unnamed)'}")
+        print("Move a keeper out of the folder or pass --include-keepers to delete it.\n")
+    if not to_delete:
+        print(f"No items to delete in {args.folder!r}.")
+        return 0
+    print(f"{len(to_delete)} item(s) in {args.folder!r} would be deleted {dest}:\n")
+    for item in to_delete:
+        view = public_item_view(item)
+        print(
+            f"  DEL   {view['id']}  {view.get('name') or '(unnamed)'}  "
+            f"user={view.get('username') or '-'}  "
+            f"hosts={','.join(view.get('hosts') or []) or '-'}"
+        )
+    print()
+    if not args.apply:
+        extra = " --permanent" if args.permanent else ""
+        report_flag = f" --report {args.report}" if args.report else ""
+        print(
+            "Dry-run only. After you have moved keepers out of the folder, re-run:\n"
+            f"  python3 dedupe_vault.py --delete-reviewed{report_flag}{extra} --apply --yes"
+        )
+        return 0
+    confirm_delete(len(to_delete), args.folder, args.permanent, args.yes)
+    ok = 0
+    failed = 0
+    for item in to_delete:
+        try:
+            delete_item(item["id"], args.session, args.permanent)
+            ok += 1
+            print(f"  deleted {item['id']}  {item.get('name')}")
+        except BwError as exc:
+            failed += 1
+            print(f"  FAILED {item['id']}: {exc}", file=sys.stderr)
+        time.sleep(args.delay)
+    if args.permanent:
+        print(f"Permanently deleted {ok}, failed {failed}.")
+    else:
+        print(
+            f"Moved {ok} item(s) to trash, failed {failed}. "
+            "Restore from Trash in Bitwarden if you still need one."
+        )
+    return 1 if failed else 0
+
+
 def cmd_undo(args: argparse.Namespace) -> int:
     require_unlocked(args.session)
     with open(args.undo, encoding="utf-8") as fh:
@@ -553,6 +732,13 @@ def cmd_undo(args: argparse.Namespace) -> int:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
 
+    if args.undo and args.delete_reviewed:
+        raise BwError("Use only one of --undo or --delete-reviewed.")
+    if args.permanent and not args.delete_reviewed:
+        raise BwError("--permanent is only valid with --delete-reviewed.")
+    if args.include_keepers and not args.delete_reviewed:
+        raise BwError("--include-keepers is only valid with --delete-reviewed.")
+
     if args.undo:
         if args.server:
             configure_server(args.server, args.session)
@@ -561,8 +747,8 @@ def main(argv: list[str] | None = None) -> int:
     folders: list[dict[str, Any]]
     if args.from_export:
         items, folders = load_items_from_export(args.from_export)
-        if args.apply:
-            raise BwError("--from-export can only generate a report. Use the CLI (no --from-export) to move items.")
+        if args.apply or args.delete_reviewed:
+            raise BwError("--from-export can only generate a report. Use the CLI (no --from-export) to move or delete items.")
     else:
         if args.server:
             configure_server(args.server, args.session)
@@ -575,6 +761,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if not isinstance(items, list):
         raise BwError("bw list items did not return a list.")
+
+    if args.delete_reviewed:
+        return cmd_delete_reviewed(args, items, folders)
 
     existing = next((f for f in folders if f.get("name") == args.folder), None)
     skip_folder_id = existing["id"] if existing else None
@@ -614,7 +803,10 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"  FAILED {item['id']}: {exc}", file=sys.stderr)
                 time.sleep(args.delay)
         print(f"Moved {len(moved_rows)} item(s). Review them in Bitwarden under {args.folder!r}.")
-        print("Nothing was deleted. Remove extras yourself after checking.")
+        print("Move anything you want to keep out of that folder, then delete the rest:")
+        report_flag = f" --report {args.report}" if args.report else ""
+        print(f"  python3 dedupe_vault.py --delete-reviewed{report_flag}")
+        print(f"  python3 dedupe_vault.py --delete-reviewed{report_flag} --apply --yes")
     elif planned:
         print("Dry-run only. Re-run with --apply to move extras into the review folder.")
 

@@ -66,10 +66,29 @@ Move extras into **Duplicates - Review**:
 python3 dedupe_vault.py --apply --report /tmp/bw-dupes.json
 ```
 
-Then open Bitwarden, open that folder, compare, and delete what you do not
-need. **This script never deletes items.**
+Then open Bitwarden, open **Duplicates - Review**, and drag anything you
+still want out of that folder (false positives). Bitwarden desktop has no
+select-all, so delete the leftovers with:
 
-Undo the moves from the report:
+```bash
+python3 dedupe_vault.py --delete-reviewed --report /tmp/bw-dupes.json
+python3 dedupe_vault.py --delete-reviewed --report /tmp/bw-dupes.json --apply --yes
+```
+
+That sends remaining extras to **Trash** (recoverable for about 30 days).
+`--report` limits deletion to items this script moved and will not delete the
+kept originals, even if a keeper is still in the folder.
+
+Without `--report`, every item still in the review folder is deleted — first
+move keepers you care about out of it.
+
+Permanent delete (not recoverable):
+
+```bash
+python3 dedupe_vault.py --delete-reviewed --report /tmp/bw-dupes.json --permanent --apply --yes
+```
+
+Undo the moves from the report (before you delete):
 
 ```bash
 python3 dedupe_vault.py --undo /tmp/bw-dupes.json        # preview
@@ -104,6 +123,10 @@ you move a keeper back.
 --from-export FILE      analyze an unencrypted JSON export (report only)
 --report FILE           write a password-free JSON report
 --undo FILE             restore folderIds from a report
+--delete-reviewed       delete leftovers still in the review folder
+--permanent             skip trash (irreversible; with --delete-reviewed)
+--include-keepers       also delete keeper copies still in the folder
+--yes                   skip the DELETE confirmation prompt
 --no-sync               skip `bw sync`
 --server URL            Vaultwarden/self-hosted origin (`bw config server`)
 ```
@@ -111,7 +134,8 @@ you move a keeper back.
 ## Safety
 
 - Dry-run unless you pass `--apply`.
-- Does not delete, merge, or change passwords.
+- `--delete-reviewed` defaults to Bitwarden trash, not permanent delete.
+- Applying a delete requires typing `DELETE` or passing `--yes`.
 - Report JSON omits passwords and TOTP.
 - Organization items can be filed into your personal folders; use `--skip-org`
   if you do not want those touched.

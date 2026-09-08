@@ -23,6 +23,17 @@ from urllib.parse import urlparse
 
 ITEM_TYPE_LOGIN = 1
 DEFAULT_FOLDER = "Duplicates - Review"
+SELF_HOST_HELP = """\
+The CLI never asks for a URL on login. Point it at your Vaultwarden
+(or other self-hosted) server first, using the same HTTPS origin as the
+web vault (no /#/ path):
+
+  bw logout
+  bw config server https://vault.example.com
+  bw login
+  export BW_SESSION=$(bw unlock --raw)
+
+Confirm the target with:  bw config server"""
 
 
 class BwError(RuntimeError):
@@ -272,8 +283,7 @@ def bw_cmd(args: list[str], session: str | None, stdin: str | None = None) -> st
             "  npm install -g @bitwarden/cli\n"
             "  # or: snap install bw\n"
             "  # or: https://bitwarden.com/help/cli/\n"
-            "  bw login\n"
-            "  export BW_SESSION=$(bw unlock --raw)"
+            f"{SELF_HOST_HELP}"
         )
     env = os.environ.copy()
     if session:
@@ -305,20 +315,50 @@ def bw_json(args: list[str], session: str | None) -> Any:
         raise BwError(f"bw {' '.join(args)} returned invalid JSON") from exc
 
 
+def current_server(session: str | None) -> str | None:
+    try:
+        value = bw_cmd(["config", "server"], session).strip()
+    except BwError:
+        return None
+    return value or None
+
+
+def configure_server(url: str, session: str | None) -> None:
+    url = url.rstrip("/")
+    existing = current_server(session)
+    if existing and existing.rstrip("/") == url:
+        return
+    status = bw_json(["status"], session)
+    state = status.get("status") if isinstance(status, dict) else None
+    if state in {"locked", "unlocked"}:
+        raise BwError(
+            f"CLI is already logged in against {existing or 'a server'}. "
+            "Log out before switching:\n"
+            "  bw logout\n"
+            f"  bw config server {url}\n"
+            "  bw login"
+        )
+    bw_cmd(["config", "server", url], session)
+    print(f"CLI server set to {url}")
+
+
 def require_unlocked(session: str | None) -> None:
     status = bw_json(["status"], session)
     if not isinstance(status, dict):
         raise BwError("Could not read `bw status`.")
     state = status.get("status")
+    server = status.get("serverUrl") or current_server(session)
+    server_note = f"\nCurrent CLI server: {server}" if server else ""
     if state == "unauthenticated":
-        raise BwError("Not logged in. Run: bw login")
+        raise BwError(f"Not logged in.{server_note}\n{SELF_HOST_HELP}")
     if state == "locked":
         raise BwError(
             "Vault is locked. Unlock in this shell first:\n"
             "  export BW_SESSION=$(bw unlock --raw)"
+            f"{server_note}"
         )
     if state != "unlocked":
-        raise BwError(f"Unexpected vault status: {state}")
+        raise BwError(f"Unexpected vault status: {state}{server_note}")
 
 
 def load_items_from_export(path: str) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
@@ -441,6 +481,16 @@ def build_parser() -> argparse.ArgumentParser:
         default=os.environ.get("BW_SESSION"),
         help="Session key. Defaults to $BW_SESSION.",
     )
+    p.add_argument(
+        "--server",
+        metavar="URL",
+        default=os.environ.get("BW_SERVER"),
+        help=(
+            "Vaultwarden / self-hosted base URL (same origin as the web vault). "
+            "Sets `bw config server` when you are logged out. "
+            "Defaults to $BW_SERVER."
+        ),
+    )
     return p
 
 
@@ -504,6 +554,8 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
 
     if args.undo:
+        if args.server:
+            configure_server(args.server, args.session)
         return cmd_undo(args)
 
     folders: list[dict[str, Any]]
@@ -512,6 +564,8 @@ def main(argv: list[str] | None = None) -> int:
         if args.apply:
             raise BwError("--from-export can only generate a report. Use the CLI (no --from-export) to move items.")
     else:
+        if args.server:
+            configure_server(args.server, args.session)
         require_unlocked(args.session)
         if not args.no_sync:
             print("Syncing vault…")

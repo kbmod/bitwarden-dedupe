@@ -17,7 +17,34 @@ other, so a third-party extension cannot read the Bitwarden vault.
 npm install -g @bitwarden/cli
 # or: snap install bw
 # or: https://bitwarden.com/help/cli/
+```
 
+### Vaultwarden / self-hosted
+
+`bw login` has no URL field. The CLI always talks to whatever server you
+configured last (Bitwarden cloud by default). Set your Vaultwarden origin
+**before** logging in — the same HTTPS URL you use in the browser, with no
+`/#/` path:
+
+```bash
+bw logout                              # if you were logged into bitwarden.com
+bw config server https://vault.example.com
+bw config server                       # should print that URL
+bw login
+export BW_SESSION=$(bw unlock --raw)
+```
+
+Or pass it to this script while logged out:
+
+```bash
+python3 dedupe_vault.py --server https://vault.example.com
+```
+
+That only runs `bw config server`; you still need `bw login` afterward.
+
+### Cloud Bitwarden
+
+```bash
 bw login
 export BW_SESSION=$(bw unlock --raw)
 ```
@@ -78,6 +105,7 @@ you move a keeper back.
 --report FILE           write a password-free JSON report
 --undo FILE             restore folderIds from a report
 --no-sync               skip `bw sync`
+--server URL            Vaultwarden/self-hosted origin (`bw config server`)
 ```
 
 ## Safety

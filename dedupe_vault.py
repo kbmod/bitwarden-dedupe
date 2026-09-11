@@ -4,7 +4,7 @@
 Uses the official Bitwarden CLI (`bw`) so decryption happens locally the same
 way the desktop app does. Passwords are never written to the report.
 
-Default is dry-run. Pass --apply to actually move items.
+Default is dry-run. Pass --apply to actually move or delete items.
 """
 
 from __future__ import annotations

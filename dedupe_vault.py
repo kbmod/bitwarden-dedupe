@@ -270,8 +270,18 @@ def plan_moves(
 
 
 def load_report(path: str) -> dict[str, Any]:
-    with open(path, encoding="utf-8") as fh:
-        report = json.load(fh)
+    try:
+        with open(path, encoding="utf-8") as fh:
+            report = json.load(fh)
+    except FileNotFoundError as exc:
+        raise BwError(
+            f"Report file not found: {path}\n"
+            "--delete-reviewed --report READS an existing report; it does not create one.\n"
+            "Write a report with:\n"
+            f"  python3 dedupe_vault.py --report {path}\n"
+            "If extras are already in the review folder, omit --report:\n"
+            "  python3 dedupe_vault.py --delete-reviewed"
+        ) from exc
     if not isinstance(report, dict):
         raise BwError("Report file must be a JSON object.")
     return report

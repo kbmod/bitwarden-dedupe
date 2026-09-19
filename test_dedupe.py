@@ -2,7 +2,9 @@
 import unittest
 
 from dedupe_vault import (
+    BwError,
     group_duplicates,
+    load_report,
     normalize_host,
     pick_keeper,
     plan_moves,
@@ -225,6 +227,13 @@ class DeleteCandidateTests(unittest.TestCase):
         )
         self.assertEqual(moved, {"e"})
         self.assertEqual(keepers, {"k"})
+
+    def test_missing_report_is_bw_error(self):
+        with self.assertRaises(BwError) as ctx:
+            load_report("/tmp/definitely-missing-bw-dupes.json")
+        msg = str(ctx.exception)
+        self.assertIn("not found", msg.lower())
+        self.assertIn("does not create", msg.lower())
 
 
 if __name__ == "__main__":

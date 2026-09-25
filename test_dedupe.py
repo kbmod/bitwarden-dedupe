@@ -3,6 +3,7 @@ import unittest
 
 from dedupe_vault import (
     BwError,
+    already_moved_rows,
     group_duplicates,
     load_report,
     normalize_host,
@@ -10,6 +11,7 @@ from dedupe_vault import (
     plan_moves,
     public_item_view,
     report_ids,
+    require_dedupe_report,
     richness,
     select_delete_candidates,
 )
@@ -148,16 +150,32 @@ class PlanTests(unittest.TestCase):
     def test_moves_extras_keeps_one(self):
         a = login("a", "Site", "me", ["https://example.com"], totp="x")
         b = login("b", "Site", "me", ["https://example.com"])
-        planned = plan_moves([[a, b]], keep="richest", move_groups=False, skip_folder_id=None, skip_org=False)
+        planned = plan_moves([[a, b]], keep="richest", move_groups=False, skip_org=False)
         self.assertEqual(len(planned), 1)
         self.assertEqual(planned[0]["keeper"]["id"], "a")
         self.assertEqual([m["id"] for m in planned[0]["move"]], ["b"])
 
-    def test_skips_items_already_in_review_folder(self):
-        a = login("a", "Site", "me", ["https://example.com"], folder_id="dup")
+    def test_still_plans_when_extras_already_in_review_folder(self):
+        keeper = login("k", "Site", "me", ["https://example.com"], totp="x")
+        extra = login("e", "Site", "me", ["https://example.com"], folder_id="dup")
+        planned = plan_moves(
+            [[keeper, extra]],
+            keep="richest",
+            move_groups=False,
+            skip_org=False,
+        )
+        self.assertEqual(len(planned), 1)
+        self.assertEqual(planned[0]["keeper"]["id"], "k")
+        self.assertEqual([m["id"] for m in planned[0]["move"]], ["e"])
+
+    def test_plans_group_when_all_copies_already_in_review_folder(self):
+        a = login("a", "Site", "me", ["https://example.com"], totp="x", folder_id="dup")
         b = login("b", "Site", "me", ["https://example.com"], folder_id="dup")
-        planned = plan_moves([[a, b]], keep="richest", move_groups=False, skip_folder_id="dup", skip_org=False)
-        self.assertEqual(planned, [])
+        planned = plan_moves(
+            [[a, b]], keep="richest", move_groups=False, skip_org=False
+        )
+        self.assertEqual(planned[0]["keeper"]["id"], "a")
+        self.assertEqual([m["id"] for m in planned[0]["move"]], ["b"])
 
     def test_public_view_strips_secrets(self):
         item = login("a", "Site", "me", ["https://example.com"], totp="otpauth://secret")
@@ -234,6 +252,71 @@ class DeleteCandidateTests(unittest.TestCase):
         msg = str(ctx.exception)
         self.assertIn("not found", msg.lower())
         self.assertIn("does not create", msg.lower())
+
+    def test_already_moved_rows_from_review_folder(self):
+        keeper = login("k", "Site", "me", ["https://example.com"], totp="x")
+        extra = login("e", "Site", "me", ["https://example.com"], folder_id="dup")
+        pending = login("p", "Site", "me", ["https://example.com"])
+        planned = plan_moves(
+            [[keeper, extra, pending]],
+            keep="richest",
+            move_groups=False,
+            skip_org=False,
+        )
+        rows = already_moved_rows(planned, "dup")
+        self.assertEqual({r["id"] for r in rows}, {"e"})
+        self.assertEqual(rows[0]["keeperId"], "k")
+
+    def test_regenerated_report_deletes_filed_extras(self):
+        keeper = login("k", "Site", "me", ["https://example.com"], totp="x")
+        extra = login("e", "Site", "me", ["https://example.com"], folder_id="dup")
+        planned = plan_moves(
+            [[keeper, extra]],
+            keep="richest",
+            move_groups=False,
+            skip_org=False,
+        )
+        report = {
+            "strategy": "host-user",
+            "folderName": "Duplicates - Review",
+            "groups": planned,
+            "moved": already_moved_rows(planned, "dup"),
+        }
+        to_delete, skipped = select_delete_candidates(
+            [keeper, extra],
+            folder_id="dup",
+            report=report,
+            skip_org=False,
+            include_keepers=False,
+        )
+        self.assertEqual([i["id"] for i in to_delete], ["e"])
+        self.assertEqual(skipped, [])
+
+    def test_empty_report_with_dedupe_shape_explains_regeneration(self):
+        with self.assertRaises(BwError) as ctx:
+            require_dedupe_report(
+                {
+                    "strategy": "host-user",
+                    "folderName": "Duplicates - Review",
+                    "groups": [],
+                    "moved": [],
+                },
+                "/tmp/bw-dupes.json",
+            )
+        msg = str(ctx.exception)
+        self.assertIn("no groups or moved items", msg.lower())
+        self.assertIn("omit --report", msg.lower())
+
+    def test_unrelated_json_is_not_a_dedupe_report(self):
+        with self.assertRaises(BwError) as ctx:
+            require_dedupe_report({"foo": 1}, "/tmp/other.json")
+        self.assertIn("does not look like a dedupe report", str(ctx.exception))
+
+    def test_report_with_groups_is_accepted(self):
+        require_dedupe_report(
+            {"groups": [{"keeper": {"id": "k"}}], "moved": []},
+            "/tmp/bw-dupes.json",
+        )
 
 
 if __name__ == "__main__":

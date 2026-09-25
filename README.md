@@ -60,8 +60,12 @@ export BW_SESSION=$(bw unlock --raw)
 
 ## Workflow
 
-All commands are dry-run unless you pass `--apply`. Keep the report file; later
-steps use it so keepers and unrelated items are not deleted.
+All commands are dry-run unless you pass `--apply`.
+
+`--report FILE` **writes** a JSON file on preview/move. The same flag on
+`--delete-reviewed` **reads** that file; it does not create it. Keep the file
+somewhere that survives reboot (not only `/tmp`) so later steps can skip
+keepers and ignore unrelated items in the review folder.
 
 ### 1. Preview duplicates
 
@@ -93,8 +97,9 @@ python3 dedupe_vault.py --delete-reviewed --report /tmp/bw-dupes.json
 python3 dedupe_vault.py --delete-reviewed --report /tmp/bw-dupes.json --apply --yes
 ```
 
-`--report` limits deletion to items this script moved and will not delete the
-kept originals.
+`--report` limits deletion to extras this script moved (including extras
+already in the review folder if you regenerated the file) and will not delete
+the kept originals.
 
 Without `--report`, every item still in the review folder is deleted. Move
 anything you want to keep out of it first.
@@ -103,6 +108,30 @@ Skip trash (not recoverable):
 
 ```bash
 python3 dedupe_vault.py --delete-reviewed --report /tmp/bw-dupes.json --permanent --apply --yes
+```
+
+### Lost the report file
+
+`--delete-reviewed --report FILE` fails if `FILE` is missing, or if an older
+script rewrote it empty after extras were already in **Duplicates - Review**.
+
+Regenerate it (no `--delete-reviewed`), then delete:
+
+```bash
+python3 dedupe_vault.py --report /tmp/bw-dupes.json
+python3 dedupe_vault.py --delete-reviewed --report /tmp/bw-dupes.json
+python3 dedupe_vault.py --delete-reviewed --report /tmp/bw-dupes.json --apply --yes
+```
+
+The new file records extras already sitting in the review folder and does not
+move them again.
+
+If you have already pulled keepers and false positives out of the folder, omit
+`--report` and delete everything still there:
+
+```bash
+python3 dedupe_vault.py --delete-reviewed
+python3 dedupe_vault.py --delete-reviewed --apply --yes
 ```
 
 ### Undo a move (before you delete)
@@ -140,8 +169,9 @@ not deleted.
 --skip-org              ignore organization items
 --include-empty-usernames
 --from-export FILE      analyze an unencrypted JSON export (report only)
---report FILE           write a password-free JSON report; with
-                        --delete-reviewed, also used as a delete filter
+--report FILE           write a password-free JSON report on preview/move;
+                        with --delete-reviewed, READ that file as a delete
+                        filter (does not create it)
 --undo FILE             put moved items back in their previous folders
 --delete-reviewed       delete leftovers still in the review folder
 --permanent             skip trash (irreversible; with --delete-reviewed)

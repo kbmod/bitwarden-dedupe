@@ -242,15 +242,12 @@ def plan_moves(
     groups: list[list[dict[str, Any]]],
     keep: str,
     move_groups: bool,
-    skip_folder_id: str | None,
     skip_org: bool,
 ) -> list[dict[str, Any]]:
     planned: list[dict[str, Any]] = []
     for group in groups:
         usable = []
         for item in group:
-            if skip_folder_id and item.get("folderId") == skip_folder_id:
-                continue
             if skip_org and item.get("organizationId"):
                 continue
             usable.append(item)
@@ -267,6 +264,54 @@ def plan_moves(
             }
         )
     return planned
+
+
+def already_moved_rows(
+    planned: list[dict[str, Any]], folder_id: str | None
+) -> list[dict[str, Any]]:
+    """Extras already sitting in the review folder from a previous apply."""
+    if not folder_id:
+        return []
+    rows: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for group in planned:
+        keeper_id = group["keeper"]["id"]
+        for item in group["move"]:
+            item_id = item.get("id")
+            if not item_id or item_id in seen:
+                continue
+            if item.get("folderId") != folder_id:
+                continue
+            seen.add(item_id)
+            rows.append(
+                {
+                    "id": item_id,
+                    "name": item.get("name"),
+                    "previousFolderId": item.get("folderId"),
+                    "keeperId": keeper_id,
+                }
+            )
+    return rows
+
+
+def require_dedupe_report(report: dict[str, Any], path: str) -> None:
+    groups = report.get("groups")
+    moved = report.get("moved")
+    shaped = (
+        isinstance(groups, list)
+        or isinstance(moved, list)
+        or (report.get("strategy") and "folderName" in report)
+    )
+    if not shaped:
+        raise BwError(f"{path} does not look like a dedupe report.")
+    if not (groups or moved):
+        raise BwError(
+            f"{path} is a dedupe report but lists no groups or moved items.\n"
+            "That happens if this file was regenerated after extras were already "
+            "in the review folder, using an older script that skipped them.\n"
+            "Omit --report to delete everything still in the folder:\n"
+            "  python3 dedupe_vault.py --delete-reviewed"
+        )
 
 
 def load_report(path: str) -> dict[str, Any]:
@@ -586,12 +631,28 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
-def print_plan(planned: list[dict[str, Any]]) -> None:
+def print_plan(planned: list[dict[str, Any]], folder_id: str | None = None) -> None:
     if not planned:
         print("No duplicates found.")
         return
-    move_count = sum(len(g["move"]) for g in planned)
-    print(f"Found {len(planned)} duplicate group(s); {move_count} item(s) would be moved.\n")
+    pending = 0
+    filed = 0
+    for group in planned:
+        for item in group["move"]:
+            if folder_id and item.get("folderId") == folder_id:
+                filed += 1
+            else:
+                pending += 1
+    if pending:
+        print(
+            f"Found {len(planned)} duplicate group(s); "
+            f"{pending} item(s) would be moved"
+            + (f", {filed} already in the review folder.\n" if filed else ".\n")
+        )
+    else:
+        print(
+            f"Found {len(planned)} duplicate group(s); extras are already in the review folder.\n"
+        )
     for i, group in enumerate(planned, 1):
         keeper = group["keeper"]
         print(f"Group {i}: {keeper.get('name') or '(unnamed)'}")
@@ -601,7 +662,13 @@ def print_plan(planned: list[dict[str, Any]]) -> None:
             f"richness={keeper['richness']}"
         )
         for item in group["move"]:
-            tag = "MOVE*" if item["id"] == keeper["id"] else "MOVE "
+            already = folder_id and item.get("folderId") == folder_id
+            if item["id"] == keeper["id"]:
+                tag = "FILED*" if already else "MOVE*"
+            elif already:
+                tag = "FILED"
+            else:
+                tag = "MOVE "
             print(
                 f"  {tag} {item['id']}  user={item.get('username') or '-'}  "
                 f"hosts={','.join(item.get('hosts') or []) or '-'}  "
@@ -643,8 +710,8 @@ def cmd_delete_reviewed(
             "Nothing to delete. Run a move pass with --apply first, or check --folder."
         )
     report = load_report(args.report) if args.report else None
-    if args.report and not (report.get("moved") or report.get("groups")):
-        raise BwError(f"{args.report} does not look like a dedupe report.")
+    if args.report:
+        require_dedupe_report(report, args.report)
     if report is None:
         print(
             "No --report given; every item still in the review folder will be "
@@ -776,49 +843,63 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_delete_reviewed(args, items, folders)
 
     existing = next((f for f in folders if f.get("name") == args.folder), None)
-    skip_folder_id = existing["id"] if existing else None
+    dest_folder_id = existing["id"] if existing else None
 
     groups = group_duplicates(items, args.strategy, args.include_empty_usernames)
     planned = plan_moves(
         groups,
         keep=args.keep,
         move_groups=args.move_groups,
-        skip_folder_id=skip_folder_id,
         skip_org=args.skip_org,
     )
-    print_plan(planned)
+    print_plan(planned, dest_folder_id)
 
     items_by_id = {i["id"]: i for i in items if i.get("id")}
-    moved_rows: list[dict[str, Any]] = []
+    moved_rows: list[dict[str, Any]] = already_moved_rows(planned, dest_folder_id)
+    already_ids = {row["id"] for row in moved_rows}
 
-    if args.apply and planned:
+    pending = [
+        (group, summary)
+        for group in planned
+        for summary in group["move"]
+        if summary["id"] not in already_ids
+    ]
+
+    if args.apply and pending:
         folder_id = ensure_folder(args.folder, folders, args.session, apply=True)
         print(f"Moving extras into folder {args.folder!r} ({folder_id})…")
-        for group in planned:
-            for summary in group["move"]:
-                item = items_by_id[summary["id"]]
-                previous = item.get("folderId")
-                try:
-                    move_item(item, folder_id, args.session)
-                    moved_rows.append(
-                        {
-                            "id": item["id"],
-                            "name": item.get("name"),
-                            "previousFolderId": previous,
-                            "keeperId": group["keeper"]["id"],
-                        }
-                    )
-                    print(f"  moved {item['id']}  {item.get('name')}")
-                except BwError as exc:
-                    print(f"  FAILED {item['id']}: {exc}", file=sys.stderr)
-                time.sleep(args.delay)
-        print(f"Moved {len(moved_rows)} item(s). Review them in Bitwarden under {args.folder!r}.")
+        for group, summary in pending:
+            item = items_by_id[summary["id"]]
+            previous = item.get("folderId")
+            try:
+                move_item(item, folder_id, args.session)
+                moved_rows.append(
+                    {
+                        "id": item["id"],
+                        "name": item.get("name"),
+                        "previousFolderId": previous,
+                        "keeperId": group["keeper"]["id"],
+                    }
+                )
+                print(f"  moved {item['id']}  {item.get('name')}")
+            except BwError as exc:
+                print(f"  FAILED {item['id']}: {exc}", file=sys.stderr)
+            time.sleep(args.delay)
+        print(f"Moved {sum(1 for r in moved_rows if r['id'] not in already_ids)} item(s). Review them in Bitwarden under {args.folder!r}.")
         print("Move anything you want to keep out of that folder, then delete the rest:")
         report_flag = f" --report {args.report}" if args.report else ""
         print(f"  python3 dedupe_vault.py --delete-reviewed{report_flag}")
         print(f"  python3 dedupe_vault.py --delete-reviewed{report_flag} --apply --yes")
-    elif planned:
+    elif pending:
         print("Dry-run only. Re-run with --apply to move extras into the review folder.")
+    elif planned:
+        print(
+            "Extras are already in the review folder. After you have pulled out "
+            "anything you want to keep, delete the rest:"
+        )
+        report_flag = f" --report {args.report}" if args.report else ""
+        print(f"  python3 dedupe_vault.py --delete-reviewed{report_flag}")
+        print(f"  python3 dedupe_vault.py --delete-reviewed{report_flag} --apply --yes")
 
     report = {
         "generatedAt": datetime.now(timezone.utc).isoformat(),
